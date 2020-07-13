@@ -14,4 +14,4 @@
 # limitations under the License.
 # ******************************************************************************
 
-set(MLIR_LLVM_COMMIT_ID 3c5dd5863c34ecd51e9d2a49929877d8151dea39)
+set(MLIR_LLVM_COMMIT_ID fb558ccae743ed451ea42a30e197eb765a3184ac)

@@ -26,7 +26,7 @@
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/StandardTypes.h"
-#include "mlir/Interfaces/SideEffects.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/STLExtras.h"
 #include <cstdarg>
 
