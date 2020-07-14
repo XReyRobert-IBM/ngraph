@@ -1357,13 +1357,9 @@ REWRITER(NGGatherOp) {
                    paramsSteps.size() == paramsLbs.size(),
                "Incorrect loop nest bounds size for gather params");
 
-  SmallVector<Value, 4> paramsIVs(vParams.rank() - 1);
-
   auto indicesLbs = vIndices.getLbs();
   auto indicesUbs = vIndices.getUbs();
   auto indicesSteps = vIndices.getSteps();
-
-  SmallVector<Value, 4> indicesIVs(vIndices.rank());
 
   SmallVector<Value, 8> paramsIndices, resIndices;
 
@@ -2229,7 +2225,7 @@ void lowerConvolution(Value result, Value images, Value filters,
               // Filters spatial loop
               affineLoopNestBuilder(
                   filtersSpatialLbs, filtersSpatialUbs, filtersSteps,
-                  [&](ValueRange filtersSpacialIndices) {
+                  [&](SmallVector<Value, 4> filtersSpacialIndices) {
                     SmallVector<Value, 4> imgIndices, filtersIndices;
                     // Image indices
                     // Here we compute the virtual start index into the padded
