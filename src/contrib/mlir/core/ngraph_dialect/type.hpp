@@ -58,7 +58,8 @@ using NGFloatType = mlir::FloatType;
 using NGIntegerType = mlir::IntegerType;
 
 /// Boolean Type.
-class NGBoolType : public mlir::Type::TypeBase<NGBoolType, mlir::Type> {
+class NGBoolType
+    : public mlir::Type::TypeBase<NGBoolType, mlir::Type, TypeStorage> {
 public:
   using Base::Base;
   static NGBoolType get(NGTypeKind kind, mlir::MLIRContext *context) {

@@ -390,8 +390,7 @@ void DialectLoweringPass::runOnOperation() {
     // in the
     // module. References the original FuncOp are no longer valid after this
     // point.
-    if (failed(applyFullConversion(origFunc, target, std::move(patterns),
-                                   &converter))) {
+    if (failed(applyFullConversion(origFunc, target, std::move(patterns)))) {
       emitError(mlir::UnknownLoc::get(&getContext()),
                 "Error lowering nGraph dialect\n");
       signalPassFailure();
@@ -1140,8 +1139,6 @@ REWRITER(NGReluOp) {
   // Bounds Index Handles
   auto lbs = vLHS.getLbs();
   auto ubs = vLHS.getUbs();
-  // Loop induction vars
-  SmallVector<Value, 4> ivs(vLHS.rank());
   // Steps
   auto steps = vLHS.getSteps();
 
@@ -1153,10 +1150,14 @@ REWRITER(NGReluOp) {
   NGRAPH_CHECK(op->getOperands()[0].getType().isa<NGTensorType>());
   auto ngTensorType = op->getOperands()[0].getType().dyn_cast<NGTensorType>();
 
-  AffineLoopNestBuilder(ivs, lbs, ubs, steps)([&] {
+  affineLoopNestBuilder(lbs, ubs, steps, [&](SmallVector<Value, 4> ivs) {
     Value val = iLHS(ivs);
     Value zero = createZeroConstant(elemTy);
-    iRes(ivs) = std_select(gt(val, zero, is_signed(ngTensorType)), val, zero);
+    if (is_signed(ngTensorType)) {
+      iRes(ivs) = std_select(sgt(val, zero), val, zero);
+    } else {
+      iRes(ivs) = std_select(ugt(val, zero), val, zero);
+    }
   });
 
   rewriter.replaceOp(op, {result});
@@ -1230,15 +1231,16 @@ REWRITER(NGDotOp) {
 
   {
     Value n, k;
-    makeAffineLoopBuilder(&n, nLb, nUb, nStep)([&] {
-      makeAffineLoopBuilder(&k, kLb, kUb,
-                            kStep)([&] { iRes(n, k) = zeroInit; });
+    affineLoopBuilder(nLb, nUb, nStep, [&](Value n) {
+      affineLoopBuilder(kLb, kUb, kStep,
+                        [&](Value k) { iRes(n, k) = zeroInit; });
     });
   }
-  makeAffineLoopBuilder(&n, nLb, nUb, nStep)([&] {
-    makeAffineLoopBuilder(&m, mLb, mUb, mStep)([&] {
-      makeAffineLoopBuilder(&k, kLb, kUb, kStep)(
-          [&] { iRes(n, k) += iLhs(n, m) * iRhs(m, k); });
+  affineLoopBuilder(nLb, nUb, nStep, [&](Value n) {
+    affineLoopBuilder(mLb, mUb, mStep, [&](Value m) {
+      affineLoopBuilder(kLb, kUb, kStep, [&](Value k) {
+        iRes(n, k) += iLhs(n, m) * iRhs(m, k);
+      });
     });
   });
 
@@ -1286,33 +1288,33 @@ REWRITER(NGConcatOp) {
     MemRefBoundsCapture vOperand(operand);
     NGRAPH_CHECK(vOperand.rank() == rank, "Unexpected rank mismatch");
 
-    llvm::SmallVector<Value, 5> indexVars;
     llvm::SmallVector<Value, 5> indexVarLbs;
     llvm::SmallVector<Value, 5> indexVarUbs;
     llvm::SmallVector<int64_t, 5> indexVarSteps;
     for (int i = 0; i < rank; i++) {
-      indexVars.push_back(Value());
       indexVarLbs.push_back(vOperand.lb(i));
       indexVarUbs.push_back(vOperand.ub(i));
       indexVarSteps.push_back(vOperand.step(i));
     }
 
-    AffineLoopNestBuilder(indexVars, indexVarLbs, indexVarUbs,
-                          indexVarSteps)([&] {
-      AffineIndexedValue ivRes(result);
-      AffineIndexedValue ivOperand(operand);
+    affineLoopNestBuilder(indexVarLbs, indexVarUbs, indexVarSteps,
+                          [&](llvm::SmallVector<Value, 5> indexVars) {
+                            AffineIndexedValue ivRes(result);
+                            AffineIndexedValue ivOperand(operand);
 
-      // On the LHS of the assignment, adjust the index for the concatenation
-      // axis.
-      llvm::SmallVector<Value, 5> resIndexHandles;
-      for (int i = 0; i < rank; i++) {
-        resIndexHandles.push_back(
-            i == concatenationAxis ? indexVars[i] + Value(concatenationAxisPos)
-                                   : indexVars[i]);
-      }
+                            // On the LHS of the assignment, adjust the index
+                            // for the concatenation axis.
+                            llvm::SmallVector<Value, 5> resIndexHandles;
+                            for (int i = 0; i < rank; i++) {
+                              resIndexHandles.push_back(
+                                  i == concatenationAxis
+                                      ? indexVars[i] +
+                                            Value(concatenationAxisPos)
+                                      : indexVars[i]);
+                            }
 
-      ivRes(resIndexHandles) = ivOperand(indexVars);
-    });
+                            ivRes(resIndexHandles) = ivOperand(indexVars);
+                          });
 
     // Move up concatenation_axis_pos for the next operand.
     concatenationAxisPos =
@@ -1393,38 +1395,45 @@ REWRITER(NGGatherOp) {
   //                   params[P_0, P_1, .. P_(A-1), indices[I_0, .., I_(M-1)],
   //                          P_(A+1), ... P_(N-1)];
 
-  AffineLoopNestBuilder(indicesIVs, indicesLbs, indicesUbs, indicesSteps)([&] {
-    // Load axis value from indices array and cast it to Index Type
-    auto axisIdx = ValueBuilder<IndexCastOp>(Value(iIndices(indicesIVs)),
-                                             rewriter.getIndexType());
+  affineLoopNestBuilder(
+      indicesLbs, indicesUbs, indicesSteps,
+      [&](SmallVector<Value, 4> indicesIVs) {
+        // Load axis value from indices array and cast it to Index Type
+        auto axisIdx = ValueBuilder<IndexCastOp>(Value(iIndices(indicesIVs)),
+                                                 rewriter.getIndexType());
 
-    AffineLoopNestBuilder(paramsIVs, paramsLbs, paramsUbs, paramsSteps)([&] {
-      // construct indices for param
-      // [P_0, P_1, .. P_axis-1, Indices[I0, I1, .. I_k-1], P_axis+1, P_axis+2,
-      // .. P_n-1]
-      for (auto i = 0, j = 0; i < vParams.rank(); i++) {
-        if (i == axis) {
-          paramsIndices.push_back(axisIdx);
-        } else {
-          paramsIndices.push_back(paramsIVs[j++]);
-        }
-      }
+        affineLoopNestBuilder(
+            paramsLbs, paramsUbs, paramsSteps,
+            [&](SmallVector<Value, 4> paramsIVs) {
+              // construct indices for param
+              // [P_0, P_1, .. P_axis-1, Indices[I0, I1, .. I_k-1], P_axis+1,
+              // P_axis+2,
+              // .. P_n-1]
+              for (auto i = 0, j = 0; i < vParams.rank(); i++) {
+                if (i == axis) {
+                  paramsIndices.push_back(axisIdx);
+                } else {
+                  paramsIndices.push_back(paramsIVs[j++]);
+                }
+              }
 
-      // construct indices for result
-      // [P_0, P_1, .. P_axis-1, I0, I1, .. I_k-1, P_axis+1, P_axis+2, .. P_n-1]
-      for (auto i = 0, j = 0; i < vParams.rank() + vIndices.rank() - 1;) {
-        if (i == axis && indicesIVs.size() > 0) {
-          resIndices.append(indicesIVs.begin(), indicesIVs.end());
-          i += indicesIVs.size();
-        } else {
-          resIndices.push_back(paramsIVs[j++]);
-          i++;
-        }
-      }
-      // Store into result
-      iRes(resIndices) = iParams(paramsIndices);
-    });
-  });
+              // construct indices for result
+              // [P_0, P_1, .. P_axis-1, I0, I1, .. I_k-1, P_axis+1, P_axis+2,
+              // .. P_n-1]
+              for (auto i = 0, j = 0;
+                   i < vParams.rank() + vIndices.rank() - 1;) {
+                if (i == axis && indicesIVs.size() > 0) {
+                  resIndices.append(indicesIVs.begin(), indicesIVs.end());
+                  i += indicesIVs.size();
+                } else {
+                  resIndices.push_back(paramsIVs[j++]);
+                  i++;
+                }
+              }
+              // Store into result
+              iRes(resIndices) = iParams(paramsIndices);
+            });
+      });
 
   rewriter.replaceOp(op, {result});
   return success();
@@ -1465,7 +1474,6 @@ REWRITER(NGGroupConvOp) {
   NGRAPH_CHECK(groups > 0, "Invalid number of groups");
   // create outer group convolution loop
   // for group = 0 to groups
-  Value iv;
   Value lb = std_constant_index(0);
   Value ub = std_constant_index(groups);
 
@@ -1491,7 +1499,7 @@ REWRITER(NGGroupConvOp) {
 
   NGRAPH_CHECK(!groupsInFilters || groups == filtersShape[0]);
 
-  makeAffineLoopBuilder(&iv, lb, ub, 1)([&] {
+  affineLoopBuilder(lb, ub, 1, [&](Value iv) {
     // lower/upper bounds on image channel dim and kernels dim
     auto cLb = iv * channelGroupSize;
     auto cUb = cLb + channelGroupSize;
@@ -2047,7 +2055,6 @@ void lowerConvolution(Value result, Value images, Value filters,
   unsigned spatialRank = vImages.rank() - 2;
 
   // Result spatial indices and bounds
-  SmallVector<Value, 4> resSpatialIndices(spatialRank);
   SmallVector<int64_t, 4> resSteps, filtersSteps;
   SmallVector<int, 4> padBelowIntValues;
   bool withPadding = false;
@@ -2167,127 +2174,134 @@ void lowerConvolution(Value result, Value images, Value filters,
 
   // Initialize output to zero
   {
-    Value n, k, c;
-    SmallVector<Value, 4> resSpatialIndices(spatialRank);
+    Value c;
 
-    makeAffineLoopBuilder(&n, batchLb, batchUb, 1)([&] {
-      makeAffineLoopBuilder(&k, numFiltersLb, numFiltersUb, 1)([&] {
-        AffineLoopNestBuilder(resSpatialIndices, resSpatialLbs, resSpatialUbs,
-                              resSteps)([&] {
-          SmallVector<Value, 4> resIndices;
-          // Result indices
-          resIndices.push_back(n);
-          if (groupConvolution && groupsInFilters) {
-            // compute global C_OUT from gID and k
-            // gId * C_OUT (num of filters) + k
-            resIndices.push_back(Value(gId) * numFiltersUb + k);
-          } else {
-            resIndices.push_back(k);
-          }
-          resIndices.insert(resIndices.end(), resSpatialIndices.begin(),
-                            resSpatialIndices.end());
-          Value zero = createZeroConstant(elemTy);
-          iRes(resIndices) = zero;
-        });
+    affineLoopBuilder(batchLb, batchUb, 1, [&](Value n) {
+      affineLoopBuilder(numFiltersLb, numFiltersUb, 1, [&](Value k) {
+        affineLoopNestBuilder(
+            resSpatialLbs, resSpatialUbs, resSteps,
+            [&](SmallVector<Value, 4> resSpatialIndices) {
+              SmallVector<Value, 4> resIndices;
+              // Result indices
+              resIndices.push_back(n);
+              if (groupConvolution && groupsInFilters) {
+                // compute global C_OUT from gID and k
+                // gId * C_OUT (num of filters) + k
+                resIndices.push_back(Value(gId) * numFiltersUb + k);
+              } else {
+                resIndices.push_back(k);
+              }
+              resIndices.insert(resIndices.end(), resSpatialIndices.begin(),
+                                resSpatialIndices.end());
+              Value zero = createZeroConstant(elemTy);
+              iRes(resIndices) = zero;
+            });
       });
     });
   }
 
-  Value n, k, c;
   // Convolution loop
-  makeAffineLoopBuilder(&n, batchLb, batchUb, 1)([&] {
+  affineLoopBuilder(batchLb, batchUb, 1, [&](Value n) {
     // Number of filters loop
-    makeAffineLoopBuilder(&k, numFiltersLb, numFiltersUb, 1)([&] {
+    affineLoopBuilder(numFiltersLb, numFiltersUb, 1, [&](Value k) {
       // Channels loop
-      makeAffineLoopBuilder(&c, numChannelsLb, numChannelsUb, 1)([&] {
+      affineLoopBuilder(numChannelsLb, numChannelsUb, 1, [&](Value c) {
         // Results loop
-        AffineLoopNestBuilder(resSpatialIndices, resSpatialLbs, resSpatialUbs,
-                              resSteps)([&] {
-          // Compute image start indices
-          SmallVector<Value, 4> imgStartIndices;
-          for (auto i = 0; i < spatialRank; i++) {
-            IntegerAttr iAttr = strides[i].cast<IntegerAttr>();
-            auto stride = std_constant_index(iAttr.getInt());
-            imgStartIndices.push_back(resSpatialIndices[i] * stride);
-          }
-          SmallVector<Value, 4> resIndices;
-          // Result indices
-          resIndices.push_back(n);
-          if (groupConvolution && groupsInFilters) {
-            // gId * C_OUT (num of filters) + k
-            resIndices.push_back(Value(gId) * numFiltersUb + k);
-          } else {
-            resIndices.push_back(k);
-          }
-
-          resIndices.insert(resIndices.end(), resSpatialIndices.begin(),
-                            resSpatialIndices.end());
-          // Filters spatial loop
-          AffineLoopNestBuilder(filtersSpatialIndices, filtersSpatialLbs,
-                                filtersSpatialUbs, filtersSteps)([&] {
-            SmallVector<Value, 4> imgIndices, filtersIndices;
-            // Image indices
-            // Here we compute the virtual start index into the padded image.
-            imgIndices.push_back(n);
-            imgIndices.push_back(c);
-            for (auto i = 0; i < spatialRank; i++) {
-              imgIndices.push_back(imgStartIndices[i] +
-                                   filtersSpatialIndices[i]);
-            }
-            // Filter indices
-
-            // If we are doing group convolution and filters shape dim0
-            // holds the number of groups, we need to use group id as the first
-            // index
-            if (groupConvolution && groupsInFilters) {
-              filtersIndices.push_back(Value(gId));
-            }
-
-            filtersIndices.push_back(k);
-            // subtract lower bound of channel
-            // if we are doing group convolution this bound will advance based
-            // on the group id. For the filters, it should always start from 0
-            filtersIndices.push_back(c - numChannelsLb);
-            filtersIndices.insert(filtersIndices.end(),
-                                  filtersSpatialIndices.begin(),
-                                  filtersSpatialIndices.end());
-
-            if (withPadding) {
-              // if args : img dims, img lbs, img ubs
-              SmallVector<Value, 4>::iterator it = imgIndices.begin();
-              std::advance(it, 2);
-              SmallVector<Value, 4> affineIfArgs(it, imgIndices.end());
-              affineIfArgs.insert(affineIfArgs.end(), imgSpatialLbs.begin(),
-                                  imgSpatialLbs.end());
-              affineIfArgs.insert(affineIfArgs.end(), imgSpatialUbs.begin(),
-                                  imgSpatialUbs.end());
-
-              auto affineIfOp = rewriter.create<AffineIfOp>(
-                  rewriter.getUnknownLoc(), nonPaddedRange, affineIfArgs,
-                  /*withElseRegion=*/false);
-              {
-                auto rewriter = affineIfOp.getThenBodyBuilder();
-                ScopedContext scope(rewriter, loc);
-                // We must subtract pad below before img load, since the
-                // physical image is not padded
-                SmallVector<Value, 4> adjustedImgIndices;
-                adjustedImgIndices.push_back(n);
-                adjustedImgIndices.push_back(c);
-                for (auto i = 0; i < spatialRank; i++) {
-                  adjustedImgIndices.push_back(
-                      imgIndices[2 + i] -
-                      std_constant_index(padBelowIntValues[i]));
-                }
-                iRes(resIndices) =
-                    iRes(resIndices) +
-                    (iImages(adjustedImgIndices) * iFilters(filtersIndices));
+        affineLoopNestBuilder(
+            resSpatialLbs, resSpatialUbs, resSteps,
+            [&](SmallVector<Value, 4> resSpatialIndices) {
+              // Compute image start indices
+              SmallVector<Value, 4> imgStartIndices;
+              for (auto i = 0; i < spatialRank; i++) {
+                IntegerAttr iAttr = strides[i].cast<IntegerAttr>();
+                auto stride = std_constant_index(iAttr.getInt());
+                imgStartIndices.push_back(resSpatialIndices[i] * stride);
               }
-            } else {
-              iRes(resIndices) = iRes(resIndices) + (iImages(imgIndices) *
-                                                     iFilters(filtersIndices));
-            }
-          });
-        });
+              SmallVector<Value, 4> resIndices;
+              // Result indices
+              resIndices.push_back(n);
+              if (groupConvolution && groupsInFilters) {
+                // gId * C_OUT (num of filters) + k
+                resIndices.push_back(Value(gId) * numFiltersUb + k);
+              } else {
+                resIndices.push_back(k);
+              }
+
+              resIndices.insert(resIndices.end(), resSpatialIndices.begin(),
+                                resSpatialIndices.end());
+              // Filters spatial loop
+              affineLoopNestBuilder(
+                  filtersSpatialLbs, filtersSpatialUbs, filtersSteps,
+                  [&](ValueRange filtersSpacialIndices) {
+                    SmallVector<Value, 4> imgIndices, filtersIndices;
+                    // Image indices
+                    // Here we compute the virtual start index into the padded
+                    // image.
+                    imgIndices.push_back(n);
+                    imgIndices.push_back(c);
+                    for (auto i = 0; i < spatialRank; i++) {
+                      imgIndices.push_back(imgStartIndices[i] +
+                                           filtersSpatialIndices[i]);
+                    }
+                    // Filter indices
+
+                    // If we are doing group convolution and filters shape dim0
+                    // holds the number of groups, we need to use group id as
+                    // the first index
+                    if (groupConvolution && groupsInFilters) {
+                      filtersIndices.push_back(Value(gId));
+                    }
+
+                    filtersIndices.push_back(k);
+                    // subtract lower bound of channel
+                    // if we are doing group convolution this bound will advance
+                    // based on the group id. For the filters, it should always
+                    // start from 0
+                    filtersIndices.push_back(c - numChannelsLb);
+                    filtersIndices.insert(filtersIndices.end(),
+                                          filtersSpatialIndices.begin(),
+                                          filtersSpatialIndices.end());
+
+                    if (withPadding) {
+                      // if args : img dims, img lbs, img ubs
+                      SmallVector<Value, 4>::iterator it = imgIndices.begin();
+                      std::advance(it, 2);
+                      SmallVector<Value, 4> affineIfArgs(it, imgIndices.end());
+                      affineIfArgs.insert(affineIfArgs.end(),
+                                          imgSpatialLbs.begin(),
+                                          imgSpatialLbs.end());
+                      affineIfArgs.insert(affineIfArgs.end(),
+                                          imgSpatialUbs.begin(),
+                                          imgSpatialUbs.end());
+
+                      auto affineIfOp = rewriter.create<AffineIfOp>(
+                          rewriter.getUnknownLoc(), nonPaddedRange,
+                          affineIfArgs,
+                          /*withElseRegion=*/false);
+                      {
+                        auto rewriter = affineIfOp.getThenBodyBuilder();
+                        ScopedContext scope(rewriter, loc);
+                        // We must subtract pad below before img load, since the
+                        // physical image is not padded
+                        SmallVector<Value, 4> adjustedImgIndices;
+                        adjustedImgIndices.push_back(n);
+                        adjustedImgIndices.push_back(c);
+                        for (auto i = 0; i < spatialRank; i++) {
+                          adjustedImgIndices.push_back(
+                              imgIndices[2 + i] -
+                              std_constant_index(padBelowIntValues[i]));
+                        }
+                        iRes(resIndices) =
+                            iRes(resIndices) + (iImages(adjustedImgIndices) *
+                                                iFilters(filtersIndices));
+                      }
+                    } else {
+                      iRes(resIndices) =
+                          iRes(resIndices) +
+                          (iImages(imgIndices) * iFilters(filtersIndices));
+                    }
+                  });
+            });
       });
     });
   });
@@ -2315,15 +2329,13 @@ void lowerUnaryElementwise(Operation *op, ArrayRef<Value> operands,
   // Bounds Index Handles
   auto lbs = vLHS.getLbs();
   auto ubs = vLHS.getUbs();
-  // Loop induction vars
-  SmallVector<Value, 4> ivs(vLHS.rank());
   // Steps
   auto steps = vLHS.getSteps();
 
   NGRAPH_CHECK(lhs.getType().isa<MemRefType>());
   Type elemTy = lhs.getType().cast<MemRefType>().getElementType();
 
-  AffineLoopNestBuilder(ivs, lbs, ubs, steps)([&] {
+  affineLoopNestBuilder(lbs, ubs, steps, [&](SmallVector<Value, 4> ivs) {
     Value val = iLHS(ivs);
     if (isa<NGNegOp>(op)) {
       Value zero = createZeroConstant(elemTy);
@@ -2355,8 +2367,6 @@ void lowerBinaryElementwise(Operation *op, ArrayRef<Value> operands,
   // Bounds Index Handles
   auto lbs = vLHS.getLbs();
   auto ubs = vLHS.getUbs();
-  // Loop induction vars
-  SmallVector<Value, 4> ivs(vLHS.rank());
   // Steps
   auto steps = vLHS.getSteps();
   // element type of the operand
@@ -2367,9 +2377,10 @@ void lowerBinaryElementwise(Operation *op, ArrayRef<Value> operands,
   NGRAPH_CHECK(op->getOperands()[0].getType().isa<NGTensorType>());
   auto ngTensorType = op->getOperands()[0].getType().dyn_cast<NGTensorType>();
 
-  AffineLoopNestBuilder(ivs, lbs, ubs, steps)(
+  affineLoopNestBuilder(
+      lbs, ubs, steps,
       // single stmt body
-      [&] {
+      [&](SmallVector<Value, 4> ivs) {
         auto left = Value(iLHS(ivs));
         auto right = Value(iRHS(ivs));
 
@@ -2390,23 +2401,35 @@ void lowerBinaryElementwise(Operation *op, ArrayRef<Value> operands,
         else if (isa<NGGreaterOp>(op)) {
           auto ones = createOneConstant(elemTy);
           auto zeros = createZeroConstant(elemTy);
-          iRes(ivs) =
-              std_select(gt(left, right, is_signed(ngTensorType)), ones, zeros);
+          if (is_signed(ngTensorType)) {
+            iRes(ivs) = std_select(sgt(left, right), ones, zeros);
+          } else {
+            iRes(ivs) = std_select(ugt(left, right), ones, zeros);
+          }
         } else if (isa<NGLessOp>(op)) {
           auto ones = createOneConstant(elemTy);
           auto zeros = createZeroConstant(elemTy);
-          iRes(ivs) =
-              std_select(lt(left, right, is_signed(ngTensorType)), ones, zeros);
+          if (is_signed(ngTensorType)) {
+            iRes(ivs) = std_select(slt(left, right), ones, zeros);
+          } else {
+            iRes(ivs) = std_select(ult(left, right), ones, zeros);
+          }
         } else if (isa<NGGreaterEqOp>(op)) {
           auto ones = createOneConstant(elemTy);
           auto zeros = createZeroConstant(elemTy);
-          iRes(ivs) =
-              std_select(ge(left, right, is_signed(ngTensorType)), ones, zeros);
+          if (is_signed(ngTensorType)) {
+            iRes(ivs) = std_select(sge(left, right), ones, zeros);
+          } else {
+            iRes(ivs) = std_select(uge(left, right), ones, zeros);
+          }
         } else if (isa<NGLessEqOp>(op)) {
           auto ones = createOneConstant(elemTy);
           auto zeros = createZeroConstant(elemTy);
-          iRes(ivs) =
-              std_select(le(left, right, is_signed(ngTensorType)), ones, zeros);
+          if (is_signed(ngTensorType)) {
+            iRes(ivs) = std_select(sle(left, right), ones, zeros);
+          } else {
+            iRes(ivs) = std_select(ule(left, right), ones, zeros);
+          }
         } else if (isa<NGEqOp>(op)) {
           auto ones = createOneConstant(elemTy);
           auto zeros = createZeroConstant(elemTy);
@@ -2416,11 +2439,17 @@ void lowerBinaryElementwise(Operation *op, ArrayRef<Value> operands,
           auto zeros = createZeroConstant(elemTy);
           iRes(ivs) = std_select(ne(left, right), ones, zeros);
         } else if (isa<NGMaxOp>(op)) {
-          iRes(ivs) =
-              std_select(gt(left, right, is_signed(ngTensorType)), left, right);
+          if (is_signed(ngTensorType)) {
+            iRes(ivs) = std_select(sgt(left, right), left, right);
+          } else {
+            iRes(ivs) = std_select(ugt(left, right), left, right);
+          }
         } else if (isa<NGMinOp>(op)) {
-          iRes(ivs) =
-              std_select(lt(left, right, is_signed(ngTensorType)), left, right);
+          if (is_signed(ngTensorType)) {
+            iRes(ivs) = std_select(slt(left, right), left, right);
+          } else {
+            iRes(ivs) = std_select(ult(left, right), left, right);
+          }
         } else {
           NGRAPH_CHECK(false, "Unsupported op");
         }
@@ -2474,16 +2503,16 @@ void lowerIndexReduction(Operation *op, ArrayRef<Value> operands,
   // Generate loop nest that initializes result to lower bound of the axis to be
   // reduced.
   {
-    SmallVector<Value, 4> ivs(vRes.rank());
     auto steps = vRes.getSteps();
     auto initVal = vArg.lb(axis);
-    AffineLoopNestBuilder(ivs, resLbs, resUbs, steps)(
-        [&] { iRes(ivs) = ValueBuilder<IndexCastOp>(initVal, resTy); });
+    affineLoopNestBuilder(
+        resLbs, resUbs, steps, [&](SmallVector<Value, 4> ivs) {
+          iRes(ivs) = ValueBuilder<IndexCastOp>(initVal, resTy);
+        });
   }
 
   // Generate loop nest that computes the actual index reduction.
   {
-    SmallVector<Value, 4> allIVs(vArg.rank());
     auto steps = vArg.getSteps();
     SmallVector<Value, 8> nonRedIVs;
     SmallVector<Value, 8> tempIVs;
@@ -2493,37 +2522,43 @@ void lowerIndexReduction(Operation *op, ArrayRef<Value> operands,
                  "Expected integer result type in index reduction");
 
     // iterate over all argument dimensions
-    AffineLoopNestBuilder(allIVs, argLbs, argUbs, steps)([&] {
-      // build a list of non-reduction IVs
-      for (auto i = 0; i < vArg.rank(); i++) {
-        if (i != axis) {
-          nonRedIVs.push_back(allIVs[i]);
-        }
-      }
+    affineLoopNestBuilder(
+        argLbs, argUbs, steps, [&](SmallVector<Value, 4> allIVs) {
+          // build a list of non-reduction IVs
+          for (auto i = 0; i < vArg.rank(); i++) {
+            if (i != axis) {
+              nonRedIVs.push_back(allIVs[i]);
+            }
+          }
 
-      // Load current min index with integer data type and convert it to index
-      // data type.
-      auto currRedIdx = ValueBuilder<IndexCastOp>(
-          Value(iRes(nonRedIVs)), IndexType::get(resTy.getContext()));
+          // Load current min index with integer data type and convert it to
+          // index data type.
+          auto currRedIdx = ValueBuilder<IndexCastOp>(
+              Value(iRes(nonRedIVs)), IndexType::get(resTy.getContext()));
 
-      // Build list of IVs including current min index.
-      for (auto i = 0; i < vArg.rank(); i++) {
-        if (i != axis) {
-          tempIVs.push_back(allIVs[i]);
-        } else {
-          tempIVs.push_back(currRedIdx);
-        }
-      }
-      Value newRedIdx = std::is_same<RedOp, NGArgMinRedOp>()
-                            ? std_select(lt(affineArg(allIVs), stdArg(tempIVs),
-                                            is_signed(ngTensorType)),
-                                         allIVs[axis], currRedIdx)
-                            : std_select(lt(stdArg(tempIVs), affineArg(allIVs),
-                                            is_signed(ngTensorType)),
-                                         allIVs[axis], currRedIdx);
+          // Build list of IVs including current min index.
+          for (auto i = 0; i < vArg.rank(); i++) {
+            if (i != axis) {
+              tempIVs.push_back(allIVs[i]);
+            } else {
+              tempIVs.push_back(currRedIdx);
+            }
+          }
+          Value newRedIdx =
+              std::is_same<RedOp, NGArgMinRedOp>()
+                  ? is_signed(ngTensorType)
+                        ? std_select(slt(affineArg(allIVs), stdArg(tempIVs)),
+                                     allIVs[axis], currRedIdx)
+                        : std_select(ult(affineArg(allIVs), stdArg(tempIVs)),
+                                     allIVs[axis], currRedIdx)
+                  : is_signed(ngTensorType)
+                        ? std_select(slt(stdArg(tempIVs), affineArg(allIVs)),
+                                     allIVs[axis], currRedIdx)
+                        : std_select(ult(stdArg(tempIVs), affineArg(allIVs)),
+                                     allIVs[axis], currRedIdx);
 
-      iRes(nonRedIVs) = ValueBuilder<IndexCastOp>(newRedIdx, resTy);
-    });
+          iRes(nonRedIVs) = ValueBuilder<IndexCastOp>(newRedIdx, resTy);
+        });
   }
 
   rewriter.replaceOp(op, result);
