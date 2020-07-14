@@ -1153,11 +1153,8 @@ REWRITER(NGReluOp) {
   affineLoopNestBuilder(lbs, ubs, steps, [&](SmallVector<Value, 4> ivs) {
     Value val = iLHS(ivs);
     Value zero = createZeroConstant(elemTy);
-    if (is_signed(ngTensorType)) {
-      iRes(ivs) = std_select(sgt(val, zero), val, zero);
-    } else {
-      iRes(ivs) = std_select(ugt(val, zero), val, zero);
-    }
+    iRes(ivs) = std_select(
+        is_signed(ngTensorType) ? sgt(val, zero) : ugt(val, zero), val, zero);
   });
 
   rewriter.replaceOp(op, {result});
@@ -2401,35 +2398,27 @@ void lowerBinaryElementwise(Operation *op, ArrayRef<Value> operands,
         else if (isa<NGGreaterOp>(op)) {
           auto ones = createOneConstant(elemTy);
           auto zeros = createZeroConstant(elemTy);
-          if (is_signed(ngTensorType)) {
-            iRes(ivs) = std_select(sgt(left, right), ones, zeros);
-          } else {
-            iRes(ivs) = std_select(ugt(left, right), ones, zeros);
-          }
+          iRes(ivs) = std_select(is_signed(ngTensorType) ? sgt(left, right)
+                                                         : ugt(left, right),
+                                 ones, zeros);
         } else if (isa<NGLessOp>(op)) {
           auto ones = createOneConstant(elemTy);
           auto zeros = createZeroConstant(elemTy);
-          if (is_signed(ngTensorType)) {
-            iRes(ivs) = std_select(slt(left, right), ones, zeros);
-          } else {
-            iRes(ivs) = std_select(ult(left, right), ones, zeros);
-          }
+          iRes(ivs) = std_select(is_signed(ngTensorType) ? slt(left, right)
+                                                         : ult(left, right),
+                                 ones, zeros);
         } else if (isa<NGGreaterEqOp>(op)) {
           auto ones = createOneConstant(elemTy);
           auto zeros = createZeroConstant(elemTy);
-          if (is_signed(ngTensorType)) {
-            iRes(ivs) = std_select(sge(left, right), ones, zeros);
-          } else {
-            iRes(ivs) = std_select(uge(left, right), ones, zeros);
-          }
+          iRes(ivs) = std_select(is_signed(ngTensorType) ? sge(left, right)
+                                                         : uge(left, right),
+                                 ones, zeros);
         } else if (isa<NGLessEqOp>(op)) {
           auto ones = createOneConstant(elemTy);
           auto zeros = createZeroConstant(elemTy);
-          if (is_signed(ngTensorType)) {
-            iRes(ivs) = std_select(sle(left, right), ones, zeros);
-          } else {
-            iRes(ivs) = std_select(ule(left, right), ones, zeros);
-          }
+          iRes(ivs) = std_select(is_signed(ngTensorType) ? sle(left, right)
+                                                         : ule(left, right),
+                                 ones, zeros);
         } else if (isa<NGEqOp>(op)) {
           auto ones = createOneConstant(elemTy);
           auto zeros = createZeroConstant(elemTy);
@@ -2439,17 +2428,13 @@ void lowerBinaryElementwise(Operation *op, ArrayRef<Value> operands,
           auto zeros = createZeroConstant(elemTy);
           iRes(ivs) = std_select(ne(left, right), ones, zeros);
         } else if (isa<NGMaxOp>(op)) {
-          if (is_signed(ngTensorType)) {
-            iRes(ivs) = std_select(sgt(left, right), left, right);
-          } else {
-            iRes(ivs) = std_select(ugt(left, right), left, right);
-          }
+          iRes(ivs) = std_select(is_signed(ngTensorType) ? sgt(left, right)
+                                                         : ugt(left, right),
+                                 left, right);
         } else if (isa<NGMinOp>(op)) {
-          if (is_signed(ngTensorType)) {
-            iRes(ivs) = std_select(slt(left, right), left, right);
-          } else {
-            iRes(ivs) = std_select(ult(left, right), left, right);
-          }
+          iRes(ivs) = std_select(is_signed(ngTensorType) ? slt(left, right)
+                                                         : ult(left, right),
+                                 left, right);
         } else {
           NGRAPH_CHECK(false, "Unsupported op");
         }
@@ -2546,16 +2531,14 @@ void lowerIndexReduction(Operation *op, ArrayRef<Value> operands,
           }
           Value newRedIdx =
               std::is_same<RedOp, NGArgMinRedOp>()
-                  ? is_signed(ngTensorType)
-                        ? std_select(slt(affineArg(allIVs), stdArg(tempIVs)),
-                                     allIVs[axis], currRedIdx)
-                        : std_select(ult(affineArg(allIVs), stdArg(tempIVs)),
-                                     allIVs[axis], currRedIdx)
-                  : is_signed(ngTensorType)
-                        ? std_select(slt(stdArg(tempIVs), affineArg(allIVs)),
-                                     allIVs[axis], currRedIdx)
-                        : std_select(ult(stdArg(tempIVs), affineArg(allIVs)),
-                                     allIVs[axis], currRedIdx);
+                  ? std_select(is_signed(ngTensorType)
+                                   ? slt(affineArg(allIVs), stdArg(tempIVs))
+                                   : ult(affineArg(allIVs), stdArg(tempIVs)),
+                               allIVs[axis], currRedIdx)
+                  : std_select(is_signed(NGTensorType)
+                                   ? slt(stdArg(tempIVs), affineArg(allIVs))
+                                   : ult(stdArg(tempIVs), affineArg(allIVs)),
+                               allIVs[axis], currRedIdx);
 
           iRes(nonRedIVs) = ValueBuilder<IndexCastOp>(newRedIdx, resTy);
         });
