@@ -2535,7 +2535,7 @@ void lowerIndexReduction(Operation *op, ArrayRef<Value> operands,
                                    ? slt(affineArg(allIVs), stdArg(tempIVs))
                                    : ult(affineArg(allIVs), stdArg(tempIVs)),
                                allIVs[axis], currRedIdx)
-                  : std_select(is_signed(NGTensorType)
+                  : std_select(is_signed(ngTensorType)
                                    ? slt(stdArg(tempIVs), affineArg(allIVs))
                                    : ult(stdArg(tempIVs), affineArg(allIVs)),
                                allIVs[axis], currRedIdx);
