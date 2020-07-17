@@ -140,7 +140,9 @@ public:
                                         funcOp.getContext()));
 
     // Tell the rewriter to convert the region signature.
-    rewriter.applySignatureConversion(&newFuncOp.getBody(), result);
+    if (failed(rewriter.convertRegionTypes(&newFuncOp.getBody(), converter,
+                                           &result)))
+      return failure();
     rewriter.replaceOp(op, llvm::None);
     return success();
   }
