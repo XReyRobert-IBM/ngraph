@@ -1150,7 +1150,8 @@ REWRITER(NGReluOp) {
   NGRAPH_CHECK(op->getOperands()[0].getType().isa<NGTensorType>());
   auto ngTensorType = op->getOperands()[0].getType().dyn_cast<NGTensorType>();
 
-  affineLoopNestBuilder(lbs, ubs, steps, [&](SmallVector<Value, 4> ivs) {
+  affineLoopNestBuilder(lbs, ubs, steps, [&](ValueRange ivRange) {
+    auto ivs = llvm::to_vector<4>(ivRange);
     Value val = iLHS(ivs);
     Value zero = createZeroConstant(elemTy);
     iRes(ivs) = std_select(
@@ -1295,7 +1296,8 @@ REWRITER(NGConcatOp) {
     }
 
     affineLoopNestBuilder(indexVarLbs, indexVarUbs, indexVarSteps,
-                          [&](llvm::SmallVector<Value, 5> indexVars) {
+                          [&](ValueRange indexVarsRange) {
+                            auto indexVars = llvm::to_vector<5>(indexVarsRange);
                             AffineIndexedValue ivRes(result);
                             AffineIndexedValue ivOperand(operand);
 
@@ -1389,15 +1391,15 @@ REWRITER(NGGatherOp) {
   //                          P_(A+1), ... P_(N-1)];
 
   affineLoopNestBuilder(
-      indicesLbs, indicesUbs, indicesSteps,
-      [&](SmallVector<Value, 4> indicesIVs) {
+      indicesLbs, indicesUbs, indicesSteps, [&](ValueRange indicesIVRange) {
+        auto indicesIVs = llvm::to_vector<4>(indicesIVRange);
         // Load axis value from indices array and cast it to Index Type
         auto axisIdx = ValueBuilder<IndexCastOp>(Value(iIndices(indicesIVs)),
                                                  rewriter.getIndexType());
 
         affineLoopNestBuilder(
-            paramsLbs, paramsUbs, paramsSteps,
-            [&](SmallVector<Value, 4> paramsIVs) {
+            paramsLbs, paramsUbs, paramsSteps, [&](ValueRange paramsIVRange) {
+              auto paramsIVs = llvm::to_vector<4>(paramsIVRange);
               // construct indices for param
               // [P_0, P_1, .. P_axis-1, Indices[I0, I1, .. I_k-1], P_axis+1,
               // P_axis+2,
@@ -2173,7 +2175,9 @@ void lowerConvolution(Value result, Value images, Value filters,
       affineLoopBuilder(numFiltersLb, numFiltersUb, 1, [&](Value k) {
         affineLoopNestBuilder(
             resSpatialLbs, resSpatialUbs, resSteps,
-            [&](SmallVector<Value, 4> resSpatialIndices) {
+            [&](ValueRange resSpatialIndicesRange) {
+              auto resSpatialIndices =
+                  llvm::to_vector<4>(resSpatialIndicesRange);
               SmallVector<Value, 4> resIndices;
               // Result indices
               resIndices.push_back(n);
@@ -2202,7 +2206,9 @@ void lowerConvolution(Value result, Value images, Value filters,
         // Results loop
         affineLoopNestBuilder(
             resSpatialLbs, resSpatialUbs, resSteps,
-            [&](SmallVector<Value, 4> resSpatialIndices) {
+            [&](ValueRange resSpatialIndicesRange) {
+              auto resSpatialIndices =
+                  llvm::to_vector<4>(resSpatialIndicesRange);
               // Compute image start indices
               SmallVector<Value, 4> imgStartIndices;
               for (auto i = 0; i < spatialRank; i++) {
@@ -2225,7 +2231,9 @@ void lowerConvolution(Value result, Value images, Value filters,
               // Filters spatial loop
               affineLoopNestBuilder(
                   filtersSpatialLbs, filtersSpatialUbs, filtersSteps,
-                  [&](SmallVector<Value, 4> filtersSpacialIndices) {
+                  [&](ValueRange filtersSpatialIndicesRange) {
+                    auto filtersSpatialIndices =
+                        llvm::to_vector<4>(filtersSpatialIndicesRange);
                     SmallVector<Value, 4> imgIndices, filtersIndices;
                     // Image indices
                     // Here we compute the virtual start index into the padded
@@ -2328,7 +2336,8 @@ void lowerUnaryElementwise(Operation *op, ArrayRef<Value> operands,
   NGRAPH_CHECK(lhs.getType().isa<MemRefType>());
   Type elemTy = lhs.getType().cast<MemRefType>().getElementType();
 
-  affineLoopNestBuilder(lbs, ubs, steps, [&](SmallVector<Value, 4> ivs) {
+  affineLoopNestBuilder(lbs, ubs, steps, [&](ValueRange ivRange) {
+    auto ivs = llvm::to_vector<4>(ivRange);
     Value val = iLHS(ivs);
     if (isa<NGNegOp>(op)) {
       Value zero = createZeroConstant(elemTy);
@@ -2373,7 +2382,8 @@ void lowerBinaryElementwise(Operation *op, ArrayRef<Value> operands,
   affineLoopNestBuilder(
       lbs, ubs, steps,
       // single stmt body
-      [&](SmallVector<Value, 4> ivs) {
+      [&](ValueRange ivRange) {
+        auto ivs = llvm::to_vector<4>(ivRange);
         auto left = Value(iLHS(ivs));
         auto right = Value(iRHS(ivs));
 
@@ -2486,10 +2496,10 @@ void lowerIndexReduction(Operation *op, ArrayRef<Value> operands,
   {
     auto steps = vRes.getSteps();
     auto initVal = vArg.lb(axis);
-    affineLoopNestBuilder(
-        resLbs, resUbs, steps, [&](SmallVector<Value, 4> ivs) {
-          iRes(ivs) = ValueBuilder<IndexCastOp>(initVal, resTy);
-        });
+    affineLoopNestBuilder(resLbs, resUbs, steps, [&](ValueRange ivRange) {
+      auto ivs = llvm::to_vector<4>(ivRange);
+      iRes(ivs) = ValueBuilder<IndexCastOp>(initVal, resTy);
+    });
   }
 
   // Generate loop nest that computes the actual index reduction.
@@ -2503,41 +2513,41 @@ void lowerIndexReduction(Operation *op, ArrayRef<Value> operands,
                  "Expected integer result type in index reduction");
 
     // iterate over all argument dimensions
-    affineLoopNestBuilder(
-        argLbs, argUbs, steps, [&](SmallVector<Value, 4> allIVs) {
-          // build a list of non-reduction IVs
-          for (auto i = 0; i < vArg.rank(); i++) {
-            if (i != axis) {
-              nonRedIVs.push_back(allIVs[i]);
-            }
-          }
+    affineLoopNestBuilder(argLbs, argUbs, steps, [&](ValueRange allIVRange) {
+      auto allIVs = llvm::to_vector<4>(allIVRange);
+      // build a list of non-reduction IVs
+      for (auto i = 0; i < vArg.rank(); i++) {
+        if (i != axis) {
+          nonRedIVs.push_back(allIVs[i]);
+        }
+      }
 
-          // Load current min index with integer data type and convert it to
-          // index data type.
-          auto currRedIdx = ValueBuilder<IndexCastOp>(
-              Value(iRes(nonRedIVs)), IndexType::get(resTy.getContext()));
+      // Load current min index with integer data type and convert it to
+      // index data type.
+      auto currRedIdx = ValueBuilder<IndexCastOp>(
+          Value(iRes(nonRedIVs)), IndexType::get(resTy.getContext()));
 
-          // Build list of IVs including current min index.
-          for (auto i = 0; i < vArg.rank(); i++) {
-            if (i != axis) {
-              tempIVs.push_back(allIVs[i]);
-            } else {
-              tempIVs.push_back(currRedIdx);
-            }
-          }
-          Value newRedIdx =
-              std::is_same<RedOp, NGArgMinRedOp>()
-                  ? std_select(is_signed(ngTensorType)
-                                   ? slt(affineArg(allIVs), stdArg(tempIVs))
-                                   : ult(affineArg(allIVs), stdArg(tempIVs)),
-                               allIVs[axis], currRedIdx)
-                  : std_select(is_signed(ngTensorType)
-                                   ? slt(stdArg(tempIVs), affineArg(allIVs))
-                                   : ult(stdArg(tempIVs), affineArg(allIVs)),
-                               allIVs[axis], currRedIdx);
+      // Build list of IVs including current min index.
+      for (auto i = 0; i < vArg.rank(); i++) {
+        if (i != axis) {
+          tempIVs.push_back(allIVs[i]);
+        } else {
+          tempIVs.push_back(currRedIdx);
+        }
+      }
+      Value newRedIdx =
+          std::is_same<RedOp, NGArgMinRedOp>()
+              ? std_select(is_signed(ngTensorType)
+                               ? slt(affineArg(allIVs), stdArg(tempIVs))
+                               : ult(affineArg(allIVs), stdArg(tempIVs)),
+                           allIVs[axis], currRedIdx)
+              : std_select(is_signed(ngTensorType)
+                               ? slt(stdArg(tempIVs), affineArg(allIVs))
+                               : ult(stdArg(tempIVs), affineArg(allIVs)),
+                           allIVs[axis], currRedIdx);
 
-          iRes(nonRedIVs) = ValueBuilder<IndexCastOp>(newRedIdx, resTy);
-        });
+      iRes(nonRedIVs) = ValueBuilder<IndexCastOp>(newRedIdx, resTy);
+    });
   }
 
   rewriter.replaceOp(op, result);
